@@ -16,7 +16,7 @@ $Properties = @(
 )
 
 # Get the manager user object for the specified email address
-$ManagerEmail = "Muhlbauer.Angela@principal.com"
+$ManagerEmail = "email@domain.com"
 $Manager = Get-ADUser -Filter {Mail -eq $ManagerEmail} -Properties DistinguishedName
 
 # Recursive function to get all direct reports and count the total number of reports
