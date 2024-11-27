@@ -1,93 +1,115 @@
-# PowerShell script to export Active Directory hierarchy from a top-level user email down through the reporting structure
+# Optimized PowerShell script to export Active Directory hierarchy from a top-level user email down through the reporting structure
 # This script requires the ActiveDirectory PowerShell module to be installed and active
-# Check if the Active Directory module is installed, if not, install it
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-    Write-Output "ActiveDirectory module not found. Installing..."
-    Install-WindowsFeature -Name RSAT-AD-PowerShell -IncludeAllSubFeature -IncludeManagementTools -ErrorAction Stop
+# Import required modules
+Import-Module ActiveDirectory -ErrorAction Stop
+Import-Module ImportExcel -ErrorAction Stop
+# Global hashtable to cache user data for reuse and minimize AD queries
+$UserCache = @{}
+# List all available domain controllers and prompt the user to select one
+$DomainControllers = Get-ADDomainController -Filter *
+for ($i = 0; $i -lt $DomainControllers.Count; $i++) {
+    Write-Output "${i}: $($DomainControllers[$i].Name)"
 }
-# Import the Active Directory Module
-Import-Module ActiveDirectory
-# Check if the ImportExcel module is installed, if not, install it
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Write-Output "ImportExcel module not found. Installing..."
-    Install-Module -Name ImportExcel -Scope CurrentUser -Force
+$SelectedIndex = Read-Host -Prompt "Please select a domain controller by number"
+if ($SelectedIndex -notmatch '^[0-9]+$' -or $SelectedIndex -ge $DomainControllers.Count) {
+    Write-Error "Invalid selection. Please run the script again and select a valid number."
+    exit
 }
-# Import the Excel Module
-Import-Module -Name ImportExcel -Scope Local
-# Global variable to track EmployeeID increment
-$Global:CurrentEmployeeID = 1
-# Function to generate a unique EmployeeID
-function Generate-SequentialEmployeeID {
-    $newID = "{0:D7}" -f $Global:CurrentEmployeeID
-    $Global:CurrentEmployeeID++
-    return $newID
+$DomainController = $DomainControllers[$SelectedIndex].Name
+# Function to retrieve and cache user information
+function Get-User {
+    param([string]$UserDN)
+    if ($UserCache.ContainsKey($UserDN)) {
+        return $UserCache[$UserDN]
+    }
+    # Fetch user if not already cached
+    $User = Get-ADUser -Identity $UserDN -Properties DisplayName,Title,Department,Mail,TelephoneNumber,DirectReports,EmployeeID,Manager
+    if ($User) {
+        $UserCache[$UserDN] = $User
+    }
+    return $User
 }
-# Function to retrieve direct reports recursively
+# Function to generate the next Employee ID dynamically
+function Get-NextEmployeeID {
+    param ([int]$Counter)
+    return "{0:D7}" -f $Counter
+}
+# Function to retrieve direct reports iteratively
 function Get-OrgStructure {
     param (
         [Parameter(Mandatory=$true)]
         [string]$UserDN, # The distinguished name of the top-level user
-        [Parameter(Mandatory=$true)]
-        [ref]$Results
+        [ref]$Results # Use ref to pass the array by reference
     )
     
-    # Get user object and add to the results list
-    $User = Get-ADUser -Identity $UserDN -Properties DisplayName,Title,Department,Mail,TelephoneNumber,DirectReports,EmployeeID,Manager
-    
-    # Assign a sequential EmployeeID, starting with "0000001" for the top user
-    $EmployeeID = Generate-SequentialEmployeeID
-    
-    $Manager = if ($User.Manager) {
-        $ManagerObj = Get-ADUser -Identity $User.Manager -Properties DisplayName, EmployeeID
-        [string]$ManagerName = $ManagerObj.DisplayName
-        [string]$ManagerEmployeeID = if ($ManagerObj.EmployeeID) { $ManagerObj.EmployeeID } else { '' }
-    } else {
+    # Initialize a queue to process users iteratively
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue($UserDN)
+    $EmployeeIDCounter = 1
+    $EmployeeIDMap = @{}
+    while ($queue.Count -gt 0) {
+        $currentUserDN = $queue.Dequeue()
+        $User = Get-User -UserDN $currentUserDN
+        if ($User -eq $null) {
+            continue
+        }
+        # Assign a sequential EmployeeID, starting with "0000001" for the top user
+        $EmployeeID = Get-NextEmployeeID -Counter $EmployeeIDCounter
+        $EmployeeIDMap[$currentUserDN] = $EmployeeID
+        $EmployeeIDCounter++
+        
         $ManagerName = ''
         $ManagerEmployeeID = ''
-    }
-    
-    $Results.Value.Add([PSCustomObject]@{
-        Name = $User.DisplayName
-        EmployeeID = $EmployeeID
-        Manager = $ManagerName
-        Manager_EmployeeID = $ManagerEmployeeID
-        Title = $User.Title
-        Department = $User.Department
-        Email = $User.Mail
-        Phone = $User.TelephoneNumber
-    })
-    # Get direct reports and iterate over them
-    if ($User.DirectReports) {
-        foreach ($report in $User.DirectReports) {
-            Get-OrgStructure -UserDN $report -Results ([ref]$Results.Value)
+        if ($User.Manager) {
+            # Ensure the manager is in the cache
+            if (-not $UserCache.ContainsKey($User.Manager)) {
+                $UserCache[$User.Manager] = Get-ADUser -Identity $User.Manager -Properties DisplayName,EmployeeID
+            }
+            # Retrieve the manager information from the cache
+            if ($UserCache.ContainsKey($User.Manager)) {
+                $ManagerObj = $UserCache[$User.Manager]
+                $ManagerName = $ManagerObj.DisplayName
+                $ManagerEmployeeID = $EmployeeIDMap[$User.Manager]
+            }
+        }
+        $Results.Value += [PSCustomObject]@{
+            Name               = $User.DisplayName
+            EmployeeID         = $EmployeeID
+            Manager            = $ManagerName
+            Manager_EmployeeID = $ManagerEmployeeID
+            Title              = $User.Title
+            Department         = $User.Department
+            Email              = $User.Mail
+            Phone              = $User.TelephoneNumber
+        }
+        # Batch get direct reports and add them to the queue
+        if ($User.DirectReports.Count -gt 0) {
+            foreach ($directReport in $User.DirectReports) {
+                if (-not $UserCache.ContainsKey($directReport)) {
+                    $queue.Enqueue($directReport)
+                }
+            }
         }
     }
 }
 # Main script
-# Get the top individual by their email address
+# Prompt the user to enter the top-level user's email address
 $TopUserEmail = Read-Host -Prompt "Please enter the email address of the top individual"
-$TopUser = Get-ADUser -Filter {Mail -eq $TopUserEmail} -Properties DistinguishedName
+# Ensure the output path exists
+$OutputPath = "C:\Exports\Lucidchart_Format_AD_Org_Chart.csv"
+if (-not (Test-Path -Path (Split-Path -Path $OutputPath -Parent))) {
+    New-Item -Path (Split-Path -Path $OutputPath -Parent) -ItemType Directory -Force
+}
+# Get the top individual by their email address
+$TopUser = Get-ADUser -Filter {Mail -eq $TopUserEmail} -Properties DistinguishedName,DisplayName,Title,Department,Mail,TelephoneNumber,DirectReports,EmployeeID,Manager
 if ($TopUser) {
-    $Results = New-Object System.Collections.Generic.List[PSCustomObject]
+    $UserCache[$TopUser.DistinguishedName] = $TopUser
+    $Results = @()
     Get-OrgStructure -UserDN $TopUser.DistinguishedName -Results ([ref]$Results)
-    # Export results to Excel Workbook
-    $OutputPath = "C:\Exports\Lucidchart_Format_AD_Org_Chart.xlsx"
-    $Results | Export-Excel -Path $OutputPath -WorksheetName "OrgChart" -AutoSize
-    Write-Output "Export complete: $OutputPath"
-    # Re-import the Excel file and update Manager_EmployeeID based on EmployeeID of the manager
-    $ImportedResults = Import-Excel -Path $OutputPath -WorksheetName "OrgChart"
-    foreach ($entry in $ImportedResults) {
-        if ($entry.Manager -ne '') {
-            $managerEntry = $ImportedResults | Where-Object { $_.Name -eq $entry.Manager }
-            if ($managerEntry) {
-                $entry.Manager_EmployeeID = $managerEntry.EmployeeID
-            }
-        }
-    }
     
-    # Export the updated results back to the Excel file
-    $ImportedResults | Export-Excel -Path $OutputPath -WorksheetName "OrgChart" -AutoSize -ClearSheet
-    Write-Output "Manager_EmployeeID fields updated: $OutputPath"
+    # Export results to CSV in one go for better performance
+    $Results | Export-Csv -Path $OutputPath -NoTypeInformation -Force
+    Write-Output "Export complete: $OutputPath"
 } else {
     Write-Error "Could not find the user with email address: $TopUserEmail"
 }
